@@ -6,4 +6,5 @@ Backed by its own token economy and supported by partners including 0g, Aethir, 
 
 
 Knidos Investment Pools: https://knidosai.xyz
+
 Knidos AI Agent on X: https://x.com/knidos_ai
