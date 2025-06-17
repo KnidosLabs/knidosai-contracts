@@ -1,54 +1,64 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity ^0.8.28;
 
-import {ERC4626} from "./extensions/CustomERC4626.sol";
-import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
-import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
-import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
-
-import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/extensions/ERC4626.sol";
 import "@openzeppelin/contracts/access/AccessControl.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
-
+using SafeERC20 for IERC20;
 
 contract CustomVault is ERC4626, AccessControl, ReentrancyGuard {
     using Math for uint256;
+
+    bytes32 public constant EXCHANGE_RATE_UPDATER_ROLE = keccak256("EXCHANGE_RATE_UPDATER_ROLE");
+    bytes32 public constant PROTOCOL_ADMIN_ROLE = keccak256("PROTOCOL_ADMIN_ROLE");
 
     struct WithdrawalRequest {
         uint256 assets;
         uint256 shares;
         address owner;
-        uint64 timestamp;
+        address receiver;
+        uint256 timestamp;
         bool claimed;
     }
 
     uint256 public REDEMPTION_PERIOD = 1 minutes;
     uint256 public exchangeRate; // scaled by 1e18
     uint256 public exchangeRateUpdateTime = 0;
+    uint256 public exchangeRateExpireInterval = 10 minutes;
     uint256 public latestRequestId;
 
     uint256 public totalRedeemingAssets = 0;
+    uint256 public totalRedeemingShares = 0;
 
     mapping(uint256 => WithdrawalRequest) public withdrawalRequests;
 
 
-    bytes32 public constant EXCHANGE_RATE_UPDATER_ROLE = keccak256("EXCHANGE_RATE_UPDATER_ROLE");
-    address[] public adminSigners;
-    uint256 public requiredApprovals = 2;
 
-    mapping(address => bool) public isWhitelisted;
+
+    // --- Multisig Whitelisting related constants ---
+
+    address[] public withdrawalSigners;
+    uint256 public requiredApprovals = 2;
 
     struct WhitelistChangeRequest {
         address target;
-        bool approved;
+        bool allowTransfer;
+        bool executed;
         uint256 approvalCount;
         mapping(address => bool) approvals;
     }
+    mapping(address => bool) public isWhitelisted;
+    mapping(uint256 => WhitelistChangeRequest) public whitelistChangeRequests;
 
-    mapping(bytes32 => WhitelistChangeRequest) public whitelistChangeRequests;
+    // --- Events ---
 
+    event WithdrawalRequested(uint256 indexed id, address indexed owner, address receiver, uint256 shares, uint256 assets);
+    event WithdrawalClaimed(uint256 indexed id, address indexed owner, address receiver, uint256 assets);
 
+    event RedemptionPeriodUpdated(uint256 oldPeriod, uint256 newPeriod);
+    event ExchangeRateExpireIntervalUpdated(uint256 oldInterval, uint256 newInterval);
+    event ExchangeRateUpdated(uint256 oldRate, uint256 newRate, uint256 timestamp);
+    event WhitelistUpdated(address indexed addr, bool status);
 
     // --- Modifiers ---
 
@@ -57,42 +67,80 @@ contract CustomVault is ERC4626, AccessControl, ReentrancyGuard {
         _;
     }
 
-    modifier onlyUpdaterOrAdmin() {
+    modifier onlyAdmin() {
         require(
-            hasRole(EXCHANGE_RATE_UPDATER_ROLE, msg.sender) ||
-            hasRole(DEFAULT_ADMIN_ROLE, msg.sender),
-            "Not updater or admin"
+            hasRole(PROTOCOL_ADMIN_ROLE, _msgSender()) ||
+            hasRole(DEFAULT_ADMIN_ROLE, _msgSender()),
+            "Not Authorized Admin"
         );
         _;
     }
 
-    modifier onlyAdminSigners() {
-        require(isAdmin(msg.sender), "Caller is not admin signer");
+    modifier onlyUpdaterOrAdmin() {
+        require(
+            hasRole(EXCHANGE_RATE_UPDATER_ROLE, _msgSender()) ||
+            hasRole(PROTOCOL_ADMIN_ROLE, _msgSender()) ||
+            hasRole(DEFAULT_ADMIN_ROLE, _msgSender()),
+            "Not Authorized Updater or Admin"
+        );
         _;
     }
 
-    constructor(address _asset, address[] memory _adminSigners) ERC20("HSKL LP Token", "HSKL-LP") ERC4626(IERC20Metadata(_asset)) {
-        require(_adminSigners.length > 0, "No admins");
+    modifier onlyWithdrawalSigners() {
+        require(isWithdrawalSigner(_msgSender()), "Not Authorized Withdrawal Signer");
+        _;
+    }
+
+    modifier whenUpToDate() {
+        require(exchangeRateUpdateTime + exchangeRateExpireInterval >= block.timestamp, "ExchangeRate is not up-to-date");
+        _;
+    }
+
+    constructor(address _asset, address[] memory _withdrawalSigners) ERC20("HSKL LP Token", "HSKL-LP") ERC4626(IERC20Metadata(_asset)) {
+        require(_withdrawalSigners.length > 0, "No admins");
 
         exchangeRate = 1e18; // 1 share = 1 asset initially
 
-        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
-        _grantRole(EXCHANGE_RATE_UPDATER_ROLE, msg.sender);
+        _grantRole(DEFAULT_ADMIN_ROLE, _msgSender());
+        _grantRole(PROTOCOL_ADMIN_ROLE, _msgSender());
+        _grantRole(EXCHANGE_RATE_UPDATER_ROLE, _msgSender());
 
-        for (uint i = 0; i < _adminSigners.length; i++) {
-            adminSigners.push(_adminSigners[i]);
+        for (uint i = 0; i < _withdrawalSigners.length; i++) {
+            withdrawalSigners.push(_withdrawalSigners[i]);
         }
     }
 
     // --- Backend Setter Functions / Vault Exchange Rate Management ---
 
-    function setRedemptionPeriod(uint256 newPeriod) external onlyRole(DEFAULT_ADMIN_ROLE) {
+    /**
+    * @notice Sets Redemption Period
+    * @param newPeriod New redemption period  
+    * @dev Only callable by admin
+    */
+    function setRedemptionPeriod(uint256 newPeriod) external onlyAdmin {
         emit RedemptionPeriodUpdated(REDEMPTION_PERIOD, newPeriod);
         REDEMPTION_PERIOD = newPeriod;
     }
 
+    /**
+    * @notice Sets exchangeRateExpireInterval
+    * @param newInterval New Interval  
+    * @dev When exchange rate expires, deposit/mint/requestWithdrawal stops
+    *      Only callable by admin
+    */
+    function setExchangeRateExpireInterval(uint256 newInterval) external onlyAdmin {
+        emit ExchangeRateExpireIntervalUpdated(exchangeRateExpireInterval, newInterval);
+        exchangeRateExpireInterval = newInterval;
+    }
+
+    /**
+    * @notice Sets exchangeRate and exchangeRateUpdateTime
+    * @param newRate New Interval  
+    * @dev New rate can't go below 1 which is the initial value,
+    *      Callable by updater or admin
+    */
     function setExchangeRate(uint256 newRate) external onlyUpdaterOrAdmin() {
-        require(newRate > 0, "Rate must be positive");
+        require(newRate > 1e18, "exchangeRate can not be below initial value of 1e18");
         exchangeRateUpdateTime = block.timestamp;
         emit ExchangeRateUpdated(exchangeRate, newRate, exchangeRateUpdateTime);
         exchangeRate = newRate;
@@ -100,87 +148,148 @@ contract CustomVault is ERC4626, AccessControl, ReentrancyGuard {
 
     // --- Multisig-Style Whitelist Management ---
 
-    function isAdmin(address addr) public view returns (bool) {
-        for (uint i = 0; i < adminSigners.length; i++) {
-            if (adminSigners[i] == addr) return true;
+    function isWithdrawalSigner(address addr) public view returns (bool) {
+        for (uint i = 0; i < withdrawalSigners.length; i++) {
+            if (withdrawalSigners[i] == addr) return true;
         }
         return false;
     }
 
-    function proposeWhitelistChange(address target, bool approved) external onlyAdminSigners {
-        bytes32 id = keccak256(abi.encodePacked(target, approved));
-        WhitelistChangeRequest storage req = whitelistChangeRequests[id];
+    function whitelistChange(address target, bool allowTransfer, uint256 reqId) external onlyWithdrawalSigners {
+        WhitelistChangeRequest storage req = whitelistChangeRequests[reqId];
 
-        require(!req.approvals[msg.sender], "Already approved");
+        require(!req.approvals[_msgSender()], "Already approved");
+        require(!req.executed, "Already executed");
         if (req.approvalCount == 0) {
             req.target = target;
-            req.approved = approved;
+            req.allowTransfer = allowTransfer;
         }
 
-        req.approvals[msg.sender] = true;
+        req.approvals[_msgSender()] = true;
         req.approvalCount++;
 
         if (req.approvalCount >= requiredApprovals) {
-            isWhitelisted[target] = approved;
-            delete whitelistChangeRequests[id];
-            emit WhitelistUpdated(target, approved);
+            isWhitelisted[target] = allowTransfer;
+            req.executed = true;
+            emit WhitelistUpdated(target, allowTransfer);
         }
     }
 
-    function protocolWithdraw(address _asset, uint256 amount, address destination) external onlyWhitelisted(destination) onlyAdminSigners nonReentrant {
-        require(IERC20(_asset).transfer(destination, amount), "Transfer failed");
+    function protocolWithdraw(
+        address _asset,
+        uint256 amount,
+        address destination
+    ) external onlyWhitelisted(destination) onlyWithdrawalSigners nonReentrant {
+        IERC20(_asset).safeTransfer(destination, amount);
     }
 
 
     // --- Overwritten Conversion Logic ---
 
     function _convertToAssets(uint256 shares, Math.Rounding rounding) internal view override virtual returns (uint256) {
-        return shares.mulDiv(exchangeRate, 1e18, rounding);
+        return shares.mulDiv(exchangeRate, 10 ** (18 + _decimalsOffset()), rounding);
     }
 
     function _convertToShares(uint256 assets, Math.Rounding rounding) internal view override virtual returns (uint256) {
-        return assets.mulDiv(1e18, exchangeRate, rounding);
+        return assets.mulDiv(10 ** (18 + _decimalsOffset()), exchangeRate, rounding);
     }
 
     // --- totalAssets Based on Exchange Rate ---
 
     function totalAssets() public view override returns (uint256) {
-        return (totalSupply() * exchangeRate) / 1e18;
+        return ((totalSupply() * exchangeRate) / 1e18) / (10 ** _decimalsOffset());
     }
 
-    // --- Withdrawal Request Flow ---
+    // --- Override default withdraw/redeem flow of ERC4626 ---
 
-    function withdraw(uint256 shares) external returns (uint256 requestId) {
-        require(shares > 0, "Zero shares");
-        uint256 assets = convertToAssets(shares);
+    function withdraw(
+        uint256 assets,
+        address receiver,
+        address owner
+    ) public override returns (uint256) {
+        revert("Withdrawals must go through requestWithdraw()");
+    }
 
-        _burn(msg.sender, shares);
+    function redeem(
+        uint256 shares,
+        address receiver,
+        address owner
+    ) public override returns (uint256) {
+        revert("Withdrawals must go through requestWithdraw()");
+    }
+
+    function _withdraw(
+        address caller,
+        address receiver,
+        address owner,
+        uint256 assets,
+        uint256 shares
+    ) internal override virtual {
+        revert("Withdrawals must go through requestWithdraw()");
+    }
+
+    // --- Withdrawal Request & Redemption Flow ---
+
+    /**
+    * @notice Burns the caller's shares and allocates the corresponding assets for redemption to the specified receiver.
+    * @param shares Amount of shares
+    * @param receiver Receiver address of the assets
+    * @dev The asset amount is computed based on the current exchange rate at the time of the request.
+    *      exchangeRate must be up-to-date for successful request of withdrawal.
+    */
+    function requestWithdrawal(uint256 shares, address receiver) external whenUpToDate returns (uint256 requestId) {
+        require(shares > 0, "Zero Shares");
+        address owner = _msgSender(); // only token owner can withdraw
+        uint256 maxShares = maxRedeem(owner);
+        if (shares > maxShares) {
+            revert ERC4626ExceededMaxRedeem(owner, shares, maxShares);
+        }
+
+        uint256 assets = previewRedeem(shares);
+
+        _burn(owner, shares);
 
         requestId = latestRequestId + 1;
         withdrawalRequests[requestId] = WithdrawalRequest({
             assets: assets,
             shares: shares,
-            owner: msg.sender,
-            timestamp: uint64(block.timestamp),
+            owner: owner,
+            receiver: receiver,
+            timestamp: block.timestamp,
             claimed: false
         });
 
         latestRequestId = requestId;
         totalRedeemingAssets += assets;
+        totalRedeemingShares += shares;
 
-        emit WithdrawalRequested(requestId, msg.sender, shares, assets);
+        emit WithdrawalRequested(requestId, owner, receiver, shares, assets);
     }
 
-    function redeem(uint256 requestId) external {
-        _redeem(requestId, msg.sender);
+    /**
+    * @notice Calls internal redeem logic
+    * @param requestId ID of the withdrawal request to redeem
+    */
+    function redeemWithdrawal(uint256 requestId) external {
+        _redeem(requestId, _msgSender());
     }
 
-    function batchRedeem(uint256[] calldata requestIds) external {
+    /**
+    * @notice Iterates over given multiple redeem requests by calling internal redeem logic
+    * @param requestIds List of IDs of withdrawal requests to redeem
+    */
+    function batchRedeemWithdrawal(uint256[] calldata requestIds) external {
         for (uint256 i = 0; i < requestIds.length; ++i) {
-            _redeem(requestIds[i], msg.sender);
+            _redeem(requestIds[i], _msgSender());
         }
     }
 
+    /**
+    * @notice Sends matured claimable assets that were allocated with requestWithdrawal to receiver.
+    * @param requestId ID of the withdrawal request to redeem
+    * @param caller Caller address
+    * @dev Should only be called after the redemption period; transfers assets to the receiver and finalizes the redemption.
+    */
     function _redeem(uint256 requestId, address caller) internal {
         WithdrawalRequest storage request = withdrawalRequests[requestId];
         require(caller == request.owner, "Caller is not the owner!");
@@ -188,11 +297,11 @@ contract CustomVault is ERC4626, AccessControl, ReentrancyGuard {
         require(block.timestamp >= request.timestamp + REDEMPTION_PERIOD, "Redemption period not over!");
 
         request.claimed = true;
-        require(IERC20(asset()).transfer(request.owner, request.assets), "Transfer failed");
+        IERC20(asset()).safeTransfer(request.receiver, request.assets);
 
         totalRedeemingAssets -= request.assets;
-
-        emit WithdrawalClaimed(requestId, request.owner, request.assets);
+        totalRedeemingShares -= request.shares;
+        emit WithdrawalClaimed(requestId, request.owner, request.receiver, request.assets);
     }
 
     // --- Views ---
@@ -200,13 +309,4 @@ contract CustomVault is ERC4626, AccessControl, ReentrancyGuard {
     function getWithdrawalRequest(uint256 requestId) external view returns (WithdrawalRequest memory) {
         return withdrawalRequests[requestId];
     }
-
-    // --- Events ---
-
-    event WithdrawalRequested(uint256 indexed id, address indexed user, uint256 shares, uint256 assets);
-    event WithdrawalClaimed(uint256 indexed id, address indexed user, uint256 assets);
-
-    event RedemptionPeriodUpdated(uint256 oldPeriod, uint256 newPeriod);
-    event ExchangeRateUpdated(uint256 oldRate, uint256 newRate, uint256 timestamp);
-    event WhitelistUpdated(address indexed addr, bool status);
 }
