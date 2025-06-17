@@ -21,19 +21,16 @@ contract CustomVault is ERC4626, AccessControl, ReentrancyGuard {
         bool claimed;
     }
 
-    uint256 public REDEMPTION_PERIOD = 1 minutes;
+    uint256 public redemptionPeriod = 1 minutes;
     uint256 public exchangeRate; // scaled by 1e18
     uint256 public exchangeRateUpdateTime = 0;
     uint256 public exchangeRateExpireInterval = 10 minutes;
     uint256 public latestRequestId;
 
-    uint256 public totalRedeemingAssets = 0;
-    uint256 public totalRedeemingShares = 0;
+    uint256 public totalClaimingAssets = 0;
+    uint256 public totalClaimingShares = 0;
 
     mapping(uint256 => WithdrawalRequest) public withdrawalRequests;
-
-
-
 
     // --- Multisig Whitelisting related constants ---
 
@@ -118,8 +115,8 @@ contract CustomVault is ERC4626, AccessControl, ReentrancyGuard {
     * @dev Only callable by admin
     */
     function setRedemptionPeriod(uint256 newPeriod) external onlyAdmin {
-        emit RedemptionPeriodUpdated(REDEMPTION_PERIOD, newPeriod);
-        REDEMPTION_PERIOD = newPeriod;
+        emit RedemptionPeriodUpdated(redemptionPeriod, newPeriod);
+        redemptionPeriod = newPeriod;
     }
 
     /**
@@ -182,7 +179,6 @@ contract CustomVault is ERC4626, AccessControl, ReentrancyGuard {
     ) external onlyWhitelisted(destination) onlyWithdrawalSigners nonReentrant {
         IERC20(_asset).safeTransfer(destination, amount);
     }
-
 
     // --- Overwritten Conversion Logic ---
 
@@ -260,53 +256,120 @@ contract CustomVault is ERC4626, AccessControl, ReentrancyGuard {
         });
 
         latestRequestId = requestId;
-        totalRedeemingAssets += assets;
-        totalRedeemingShares += shares;
+        totalClaimingAssets += assets;
+        totalClaimingShares += shares;
 
         emit WithdrawalRequested(requestId, owner, receiver, shares, assets);
     }
 
     /**
-    * @notice Calls internal redeem logic
-    * @param requestId ID of the withdrawal request to redeem
+    * @notice Calls internal claim logic
+    * @param requestId ID of the withdrawal request to claim
     */
-    function redeemWithdrawal(uint256 requestId) external {
-        _redeem(requestId, _msgSender());
+    function claimWithdrawal(uint256 requestId) external {
+        _claim(requestId, _msgSender());
     }
 
     /**
-    * @notice Iterates over given multiple redeem requests by calling internal redeem logic
-    * @param requestIds List of IDs of withdrawal requests to redeem
+    * @notice Iterates over given multiple claim requests by calling internal claim logic
+    * @param requestIds List of IDs of withdrawal requests to claim
     */
-    function batchRedeemWithdrawal(uint256[] calldata requestIds) external {
+    function batchClaimWithdrawal(uint256[] calldata requestIds) external {
         for (uint256 i = 0; i < requestIds.length; ++i) {
-            _redeem(requestIds[i], _msgSender());
+            _claim(requestIds[i], _msgSender());
         }
     }
 
     /**
     * @notice Sends matured claimable assets that were allocated with requestWithdrawal to receiver.
-    * @param requestId ID of the withdrawal request to redeem
+    * @param requestId ID of the withdrawal request to claim
     * @param caller Caller address
     * @dev Should only be called after the redemption period; transfers assets to the receiver and finalizes the redemption.
     */
-    function _redeem(uint256 requestId, address caller) internal {
+    function _claim(uint256 requestId, address caller) internal {
         WithdrawalRequest storage request = withdrawalRequests[requestId];
         require(caller == request.owner, "Caller is not the owner!");
         require(!request.claimed, "This request is already claimed!");
-        require(block.timestamp >= request.timestamp + REDEMPTION_PERIOD, "Redemption period not over!");
+        require(block.timestamp >= request.timestamp + redemptionPeriod, "Redemption period not over!");
 
         request.claimed = true;
         IERC20(asset()).safeTransfer(request.receiver, request.assets);
 
-        totalRedeemingAssets -= request.assets;
-        totalRedeemingShares -= request.shares;
+        totalClaimingAssets -= request.assets;
+        totalClaimingShares -= request.shares;
         emit WithdrawalClaimed(requestId, request.owner, request.receiver, request.assets);
     }
 
     // --- Views ---
 
+    /**
+    * @notice Returns withdrawalRequest
+    * @param requestId ID of the withdrawalRequest
+    */
     function getWithdrawalRequest(uint256 requestId) external view returns (WithdrawalRequest memory) {
         return withdrawalRequests[requestId];
+    }
+
+    /**
+    * @notice Returns if the withdrawalRequest is claimable
+    * @param requestId ID of the withdrawalRequest
+    */
+    function isClaimable(uint256 requestId) external view returns (bool) {
+        WithdrawalRequest storage req = withdrawalRequests[requestId];
+        return !req.claimed && block.timestamp >= req.timestamp + redemptionPeriod;
+    }
+
+    /**
+    * @notice Returns remaining redemption period for withdrawal request
+    * @param requestId ID of the withdrawalRequest
+    * @dev If requestId is invalid or is claimable, returns 0
+    */
+    function timeUntilClaimable(uint256 requestId) external view returns (uint256) {
+        WithdrawalRequest storage req = withdrawalRequests[requestId];
+        if (block.timestamp >= req.timestamp + redemptionPeriod) {
+            return 0;
+        }
+        return (req.timestamp + redemptionPeriod) - block.timestamp;
+    }
+
+    /**
+    * @notice Returns most recent withdrawalRequest's by owner
+    * @param limit Amount of withdrawalRequest to get
+    * @param ownerFilter Filters owner address or 0 address for no filter
+    * @param receiverFilter Filters receiver address or 0 address for no filter
+    * @param onlyUnclaimed Filters unclaimed records
+    * @param onlyClaimable Filters claimable records
+    */
+    function filterWithdrawalRequests(
+        uint256 limit,
+        address ownerFilter,
+        address receiverFilter,
+        bool onlyUnclaimed,
+        bool onlyClaimable
+    ) external view returns (WithdrawalRequest[] memory) 
+    {
+        uint256 found;
+        WithdrawalRequest[] memory temp = new WithdrawalRequest[](limit);
+
+        uint256 i = latestRequestId;
+        while (i > 0 && found < limit) {
+            i--;
+            WithdrawalRequest storage req = withdrawalRequests[i];
+
+            if (ownerFilter != address(0) && req.owner != ownerFilter) continue;
+            if (receiverFilter != address(0) && req.receiver != receiverFilter) continue;
+            if (onlyUnclaimed && req.claimed) continue;
+            if (onlyClaimable && block.timestamp < req.timestamp + redemptionPeriod) continue;
+
+            temp[found++] = req;
+        }
+
+        // trim result
+        WithdrawalRequest[] memory result = new WithdrawalRequest[](found);
+        for (uint256 j = 0; j < found; j++) {
+            result[j] = temp[j];
+        }
+
+        return result;
     }
 }
