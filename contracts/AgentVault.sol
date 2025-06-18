@@ -9,8 +9,10 @@ using SafeERC20 for IERC20;
 contract CustomVault is ERC4626, AccessControl, ReentrancyGuard {
     using Math for uint256;
 
-    bytes32 public constant EXCHANGE_RATE_UPDATER_ROLE = keccak256("EXCHANGE_RATE_UPDATER_ROLE");
+    bytes32 public constant BACKEND_ROLE = keccak256("BACKEND_ROLE");
     bytes32 public constant PROTOCOL_ADMIN_ROLE = keccak256("PROTOCOL_ADMIN_ROLE");
+
+    uint256 public constant MIN_EXCHANGE_RATE;
 
     struct WithdrawalRequest {
         uint256 assets;
@@ -73,9 +75,9 @@ contract CustomVault is ERC4626, AccessControl, ReentrancyGuard {
         _;
     }
 
-    modifier onlyUpdaterOrAdmin() {
+    modifier onlyBackendAndAdmin() {
         require(
-            hasRole(EXCHANGE_RATE_UPDATER_ROLE, _msgSender()) ||
+            hasRole(BACKEND_ROLE, _msgSender()) ||
             hasRole(PROTOCOL_ADMIN_ROLE, _msgSender()) ||
             hasRole(DEFAULT_ADMIN_ROLE, _msgSender()),
             "Not Authorized Updater or Admin"
@@ -96,11 +98,12 @@ contract CustomVault is ERC4626, AccessControl, ReentrancyGuard {
     constructor(address _asset, address[] memory _withdrawalSigners) ERC20("HSKL LP Token", "HSKL-LP") ERC4626(IERC20Metadata(_asset)) {
         require(_withdrawalSigners.length > 0, "No admins");
 
+        MIN_EXCHANGE_RATE = 1e18;
         exchangeRate = 1e18; // 1 share = 1 asset initially
 
         _grantRole(DEFAULT_ADMIN_ROLE, _msgSender());
         _grantRole(PROTOCOL_ADMIN_ROLE, _msgSender());
-        _grantRole(EXCHANGE_RATE_UPDATER_ROLE, _msgSender());
+        _grantRole(BACKEND_ROLE, _msgSender());
 
         for (uint i = 0; i < _withdrawalSigners.length; i++) {
             withdrawalSigners.push(_withdrawalSigners[i]);
@@ -136,8 +139,8 @@ contract CustomVault is ERC4626, AccessControl, ReentrancyGuard {
     * @dev New rate can't go below 1 which is the initial value,
     *      Callable by updater or admin
     */
-    function setExchangeRate(uint256 newRate) external onlyUpdaterOrAdmin() {
-        require(newRate > 1e18, "exchangeRate can not be below initial value of 1e18");
+    function setExchangeRate(uint256 newRate) external onlyBackendAndAdmin {
+        require(newRate >= MIN_EXCHANGE_RATE, "exchangeRate can not be below initial value of 1e18");
         exchangeRateUpdateTime = block.timestamp;
         emit ExchangeRateUpdated(exchangeRate, newRate, exchangeRateUpdateTime);
         exchangeRate = newRate;
@@ -176,7 +179,7 @@ contract CustomVault is ERC4626, AccessControl, ReentrancyGuard {
         address _asset,
         uint256 amount,
         address destination
-    ) external onlyWhitelisted(destination) onlyWithdrawalSigners nonReentrant {
+    ) external onlyWhitelisted(destination) onlyBackendAndAdmin nonReentrant {
         IERC20(_asset).safeTransfer(destination, amount);
     }
 
@@ -333,7 +336,7 @@ contract CustomVault is ERC4626, AccessControl, ReentrancyGuard {
     }
 
     /**
-    * @notice Returns most recent withdrawalRequest's by owner
+    * @notice Returns most recent withdrawalRequests by filters
     * @param limit Amount of withdrawalRequest to get
     * @param ownerFilter Filters owner address or 0 address for no filter
     * @param receiverFilter Filters receiver address or 0 address for no filter
@@ -353,14 +356,12 @@ contract CustomVault is ERC4626, AccessControl, ReentrancyGuard {
 
         uint256 i = latestRequestId;
         while (i > 0 && found < limit) {
-            i--;
             WithdrawalRequest storage req = withdrawalRequests[i];
-
+            i--;
             if (ownerFilter != address(0) && req.owner != ownerFilter) continue;
             if (receiverFilter != address(0) && req.receiver != receiverFilter) continue;
             if (onlyUnclaimed && req.claimed) continue;
             if (onlyClaimable && block.timestamp < req.timestamp + redemptionPeriod) continue;
-
             temp[found++] = req;
         }
 
