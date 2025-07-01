@@ -1,18 +1,20 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
-import "@openzeppelin/contracts/token/ERC20/extensions/ERC4626.sol";
-import "@openzeppelin/contracts/access/AccessControl.sol";
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC20/extensions/ERC4626Upgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 using SafeERC20 for IERC20;
 
-contract CustomVault is ERC4626, AccessControl, ReentrancyGuard {
+contract CustomVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, AccessControlUpgradeable, ReentrancyGuardUpgradeable {
     using Math for uint256;
 
     bytes32 public constant BACKEND_ROLE = keccak256("BACKEND_ROLE");
     bytes32 public constant PROTOCOL_ADMIN_ROLE = keccak256("PROTOCOL_ADMIN_ROLE");
 
-    uint256 public constant MIN_EXCHANGE_RATE;
+    uint256 public MIN_EXCHANGE_RATE;
 
     struct WithdrawalRequest {
         uint256 assets;
@@ -23,21 +25,32 @@ contract CustomVault is ERC4626, AccessControl, ReentrancyGuard {
         bool claimed;
     }
 
-    uint256 public redemptionPeriod = 1 minutes;
-    uint256 public exchangeRate; // scaled by 1e18
-    uint256 public exchangeRateUpdateTime = 0;
-    uint256 public exchangeRateExpireInterval = 10 minutes;
-    uint256 public latestRequestId;
+    struct WithdrawalRequestView {
+        uint256 requestId;
+        uint256 assets;
+        uint256 shares;
+        address owner;
+        address receiver;
+        uint256 timestamp;
+        bool claimed;
+    }
 
-    uint256 public totalClaimingAssets = 0;
-    uint256 public totalClaimingShares = 0;
+    uint256 public redemptionPeriod;
+    uint256 public exchangeRate; // scaled by 1e18
+    uint256 public exchangeRateUpdateTime;
+    uint256 public exchangeRateExpireInterval;
+    uint256 public latestRequestId;
+    uint256 public totalAssetsCap;
+
+    uint256 public totalWithdrawingAssets;
+    uint256 public totalWithdrawingShares;
 
     mapping(uint256 => WithdrawalRequest) public withdrawalRequests;
 
     // --- Multisig Whitelisting related constants ---
 
-    address[] public withdrawalSigners;
-    uint256 public requiredApprovals = 2;
+    address[] public multisigSigners;
+    uint256 public requiredApprovals;
 
     struct WhitelistChangeRequest {
         address target;
@@ -49,6 +62,13 @@ contract CustomVault is ERC4626, AccessControl, ReentrancyGuard {
     mapping(address => bool) public isWhitelisted;
     mapping(uint256 => WhitelistChangeRequest) public whitelistChangeRequests;
 
+    struct AssetsCapChangeRequest {
+        uint256 target;
+        uint256 approvalCount;
+        mapping(address => bool) approvals;
+    }
+    AssetsCapChangeRequest public capChangeRequest;
+
     // --- Events ---
 
     event WithdrawalRequested(uint256 indexed id, address indexed owner, address receiver, uint256 shares, uint256 assets);
@@ -58,6 +78,7 @@ contract CustomVault is ERC4626, AccessControl, ReentrancyGuard {
     event ExchangeRateExpireIntervalUpdated(uint256 oldInterval, uint256 newInterval);
     event ExchangeRateUpdated(uint256 oldRate, uint256 newRate, uint256 timestamp);
     event WhitelistUpdated(address indexed addr, bool status);
+    event AssetsCapUpdated(uint256 oldCap, uint256 newCap);
 
     // --- Modifiers ---
 
@@ -85,8 +106,8 @@ contract CustomVault is ERC4626, AccessControl, ReentrancyGuard {
         _;
     }
 
-    modifier onlyWithdrawalSigners() {
-        require(isWithdrawalSigner(_msgSender()), "Not Authorized Withdrawal Signer");
+    modifier onlyMultisigSigners() {
+        require(isMultisigSigner(_msgSender()), "Not Authorized Multisig Signer");
         _;
     }
 
@@ -95,20 +116,49 @@ contract CustomVault is ERC4626, AccessControl, ReentrancyGuard {
         _;
     }
 
-    constructor(address _asset, address[] memory _withdrawalSigners) ERC20("HSKL LP Token", "HSKL-LP") ERC4626(IERC20Metadata(_asset)) {
-        require(_withdrawalSigners.length > 0, "No admins");
+    modifier whenUnderCap(uint256 assetsToAdd) {
+        require(totalAssets() + assetsToAdd <= totalAssetsCap, "Vault Cap Reached");
+        _;
+    }
 
+    constructor() {
+        _disableInitializers();
+    }
+
+    function initialize(
+        address _asset,
+        string memory _name,
+        string memory _symbol,
+        address admin,
+        address[] memory _multisigSigners
+    ) public initializer {
+        __ERC4626_init(IERC20Metadata(_asset));
+        __ERC20_init(_name, _symbol);
+        __AccessControl_init();
+        __ReentrancyGuard_init();
+        __UUPSUpgradeable_init();
+
+        // TEST PARAMETERS
+        _grantRole(DEFAULT_ADMIN_ROLE, admin);
+        _grantRole(PROTOCOL_ADMIN_ROLE, admin);
+        _grantRole(BACKEND_ROLE, admin);
+
+        require(_multisigSigners.length > 0, "No admins");
         MIN_EXCHANGE_RATE = 1e18;
         exchangeRate = 1e18; // 1 share = 1 asset initially
-
-        _grantRole(DEFAULT_ADMIN_ROLE, _msgSender());
-        _grantRole(PROTOCOL_ADMIN_ROLE, _msgSender());
-        _grantRole(BACKEND_ROLE, _msgSender());
-
-        for (uint i = 0; i < _withdrawalSigners.length; i++) {
-            withdrawalSigners.push(_withdrawalSigners[i]);
+        exchangeRateExpireInterval = 30 days;
+        exchangeRateUpdateTime = block.timestamp;
+        totalAssetsCap = 100_000_000_000;
+        totalWithdrawingAssets = 0;
+        totalWithdrawingShares = 0;
+        redemptionPeriod = 3 minutes;
+        requiredApprovals = _multisigSigners.length;
+        for (uint i = 0; i < _multisigSigners.length; i++) {
+            multisigSigners.push(_multisigSigners[i]);
         }
     }
+
+    function _authorizeUpgrade(address newImplementation) internal override onlyAdmin {}
 
     // --- Backend Setter Functions / Vault Exchange Rate Management ---
 
@@ -148,14 +198,14 @@ contract CustomVault is ERC4626, AccessControl, ReentrancyGuard {
 
     // --- Multisig-Style Whitelist Management ---
 
-    function isWithdrawalSigner(address addr) public view returns (bool) {
-        for (uint i = 0; i < withdrawalSigners.length; i++) {
-            if (withdrawalSigners[i] == addr) return true;
+    function isMultisigSigner(address addr) public view returns (bool) {
+        for (uint i = 0; i < multisigSigners.length; i++) {
+            if (multisigSigners[i] == addr) return true;
         }
         return false;
     }
 
-    function whitelistChange(address target, bool allowTransfer, uint256 reqId) external onlyWithdrawalSigners {
+    function whitelistChange(address target, bool allowTransfer, uint256 reqId) external onlyMultisigSigners {
         WhitelistChangeRequest storage req = whitelistChangeRequests[reqId];
 
         require(!req.approvals[_msgSender()], "Already approved");
@@ -172,6 +222,28 @@ contract CustomVault is ERC4626, AccessControl, ReentrancyGuard {
             isWhitelisted[target] = allowTransfer;
             req.executed = true;
             emit WhitelistUpdated(target, allowTransfer);
+        }
+    }
+
+    function assetsCapChange(uint256 newTarget) external onlyMultisigSigners {
+        if (capChangeRequest.target != newTarget) {
+            capChangeRequest.target = newTarget;
+            capChangeRequest.approvalCount = 0;
+            for (uint256 i = 0; i < multisigSigners.length; i++) {
+                capChangeRequest.approvals[multisigSigners[i]] = false;
+            }
+        }
+
+        require(!capChangeRequest.approvals[_msgSender()], "Already approved");
+        capChangeRequest.approvals[_msgSender()] = true;
+        capChangeRequest.approvalCount += 1;
+
+        if (capChangeRequest.approvalCount >= requiredApprovals) {
+            totalAssetsCap = capChangeRequest.target;
+            capChangeRequest.approvalCount = 0;
+            for (uint256 i = 0; i < multisigSigners.length; i++) {
+                capChangeRequest.approvals[multisigSigners[i]] = false;
+            }
         }
     }
 
@@ -197,6 +269,16 @@ contract CustomVault is ERC4626, AccessControl, ReentrancyGuard {
 
     function totalAssets() public view override returns (uint256) {
         return ((totalSupply() * exchangeRate) / 1e18) / (10 ** _decimalsOffset());
+    }
+
+    // --- Override deposit and mint functions to add whenUpToDate ---
+
+    function mint(uint256 shares, address receiver) public override whenUpToDate whenUnderCap(previewMint(shares)) returns (uint256) {
+        return super.mint(shares, receiver);
+    }
+
+    function deposit(uint256 assets, address receiver) public override whenUpToDate whenUnderCap(assets) returns (uint256) {
+        return super.deposit(assets, receiver);
     }
 
     // --- Override default withdraw/redeem flow of ERC4626 ---
@@ -259,8 +341,8 @@ contract CustomVault is ERC4626, AccessControl, ReentrancyGuard {
         });
 
         latestRequestId = requestId;
-        totalClaimingAssets += assets;
-        totalClaimingShares += shares;
+        totalWithdrawingAssets += assets;
+        totalWithdrawingShares += shares;
 
         emit WithdrawalRequested(requestId, owner, receiver, shares, assets);
     }
@@ -298,8 +380,8 @@ contract CustomVault is ERC4626, AccessControl, ReentrancyGuard {
         request.claimed = true;
         IERC20(asset()).safeTransfer(request.receiver, request.assets);
 
-        totalClaimingAssets -= request.assets;
-        totalClaimingShares -= request.shares;
+        totalWithdrawingAssets -= request.assets;
+        totalWithdrawingShares -= request.shares;
         emit WithdrawalClaimed(requestId, request.owner, request.receiver, request.assets);
     }
 
@@ -349,10 +431,10 @@ contract CustomVault is ERC4626, AccessControl, ReentrancyGuard {
         address receiverFilter,
         bool onlyUnclaimed,
         bool onlyClaimable
-    ) external view returns (WithdrawalRequest[] memory) 
+    ) external view returns (WithdrawalRequestView[] memory) 
     {
         uint256 found;
-        WithdrawalRequest[] memory temp = new WithdrawalRequest[](limit);
+        WithdrawalRequestView[] memory temp = new WithdrawalRequestView[](limit);
 
         uint256 i = latestRequestId;
         while (i > 0 && found < limit) {
@@ -362,15 +444,68 @@ contract CustomVault is ERC4626, AccessControl, ReentrancyGuard {
             if (receiverFilter != address(0) && req.receiver != receiverFilter) continue;
             if (onlyUnclaimed && req.claimed) continue;
             if (onlyClaimable && block.timestamp < req.timestamp + redemptionPeriod) continue;
-            temp[found++] = req;
+            temp[found++] = WithdrawalRequestView({
+                requestId: i+1,
+                assets: req.assets,
+                shares: req.shares,
+                owner: req.owner,
+                receiver: req.receiver,
+                timestamp: req.timestamp,
+                claimed: req.claimed
+            });
         }
 
         // trim result
-        WithdrawalRequest[] memory result = new WithdrawalRequest[](found);
+        WithdrawalRequestView[] memory result = new WithdrawalRequestView[](found);
         for (uint256 j = 0; j < found; j++) {
             result[j] = temp[j];
         }
 
         return result;
+    }
+
+    /**
+    * @notice Returns the amount of assets that are redeeming
+    * @dev Changing redemptionPeriod to a smaller timespan can cause this view to calculate wrong amounts
+    */
+    function totalWithdrawingAssetsInRedemptionPeriod() external view returns (uint256 totalRedeemingAssets) {
+        for (uint256 i = latestRequestId; i > 0; i--) {
+            WithdrawalRequest storage req = withdrawalRequests[i];
+            // Stop early if the request is already claimable (i.e. redemption period over)
+            if (block.timestamp >= req.timestamp + redemptionPeriod) break;
+            if (!req.claimed && block.timestamp >= req.timestamp && block.timestamp < req.timestamp + redemptionPeriod) {
+                totalRedeemingAssets += req.assets;
+            }
+        }
+    }
+
+    /**
+    * @notice Returns the amount of assets that are requested withdrawal and not claimed for a time span
+    * @param startTimestamp Epoch start timestamp
+    * @param endTimestamp Epoch end timestamp
+    */
+    function totalWithdrawingAssetsInRange(uint256 startTimestamp, uint256 endTimestamp) external view returns (uint256 totalClaimableAssets) {
+        for (uint256 i = latestRequestId; i > 0; i--) {
+            WithdrawalRequest storage req = withdrawalRequests[i];
+            if (req.timestamp < startTimestamp) break;
+            if (!req.claimed && req.timestamp >= startTimestamp && req.timestamp < endTimestamp) {
+                totalClaimableAssets += req.assets;
+            }
+        }
+    }
+
+    /**
+    * @notice Returns the amount of assets that is claimable at given time
+    * @param timestamp Epoch timestamp
+    */
+    function totalClaimableAssetsAtTime(uint256 timestamp) external view returns (uint256 claimableAssets) {
+        claimableAssets = totalWithdrawingAssets;
+        for (uint256 i = latestRequestId; i > 0; i--) {
+            WithdrawalRequest storage req = withdrawalRequests[i];
+            if (req.claimed) continue;
+            if (timestamp < req.timestamp + redemptionPeriod) {
+                claimableAssets -= req.assets;
+            }
+        }
     }
 }
