@@ -144,14 +144,14 @@ contract CustomVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Acce
         _grantRole(BACKEND_ROLE, admin);
 
         require(_multisigSigners.length > 0, "No admins");
-        MIN_EXCHANGE_RATE = 1e18;
+        MIN_EXCHANGE_RATE = 5e17; // 0.5 test param
         exchangeRate = 1e18; // 1 share = 1 asset initially
-        exchangeRateExpireInterval = 30 days;
+        exchangeRateExpireInterval = 5 days;
         exchangeRateUpdateTime = block.timestamp;
-        totalAssetsCap = 100_000_000_000;
+        totalAssetsCap = 1000e6; // 1000 * (10 ** 6) for initial USDC cap for FUJI Testnet 
         totalWithdrawingAssets = 0;
         totalWithdrawingShares = 0;
-        redemptionPeriod = 3 minutes;
+        redemptionPeriod = 15 minutes;
         requiredApprovals = _multisigSigners.length;
         for (uint i = 0; i < _multisigSigners.length; i++) {
             multisigSigners.push(_multisigSigners[i]);
@@ -468,28 +468,30 @@ contract CustomVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Acce
     * @notice Returns the amount of assets that are redeeming
     * @dev Changing redemptionPeriod to a smaller timespan can cause this view to calculate wrong amounts
     */
-    function totalWithdrawingAssetsInRedemptionPeriod() external view returns (uint256 totalRedeemingAssets) {
+    function totalWithdrawingAssetsInRedemptionPeriod() external view returns (uint256 _amount) {
         for (uint256 i = latestRequestId; i > 0; i--) {
             WithdrawalRequest storage req = withdrawalRequests[i];
             // Stop early if the request is already claimable (i.e. redemption period over)
             if (block.timestamp >= req.timestamp + redemptionPeriod) break;
             if (!req.claimed && block.timestamp >= req.timestamp && block.timestamp < req.timestamp + redemptionPeriod) {
-                totalRedeemingAssets += req.assets;
+                _amount += req.assets;
             }
         }
     }
 
     /**
     * @notice Returns the amount of assets that are requested withdrawal and not claimed for a time span
+    * @param onlyUnclaimed Filter to exclude claimed records
     * @param startTimestamp Epoch start timestamp
     * @param endTimestamp Epoch end timestamp
     */
-    function totalWithdrawingAssetsInRange(uint256 startTimestamp, uint256 endTimestamp) external view returns (uint256 totalClaimableAssets) {
+    function totalWithdrawingAssetsInRange(bool onlyUnclaimed, uint256 startTimestamp, uint256 endTimestamp) external view returns (uint256 _amount) {
         for (uint256 i = latestRequestId; i > 0; i--) {
             WithdrawalRequest storage req = withdrawalRequests[i];
             if (req.timestamp < startTimestamp) break;
-            if (!req.claimed && req.timestamp >= startTimestamp && req.timestamp < endTimestamp) {
-                totalClaimableAssets += req.assets;
+            if (onlyUnclaimed && req.claimed) continue;
+            if (req.timestamp >= startTimestamp && req.timestamp < endTimestamp) {
+                _amount += req.assets;
             }
         }
     }
@@ -498,13 +500,13 @@ contract CustomVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Acce
     * @notice Returns the amount of assets that is claimable at given time
     * @param timestamp Epoch timestamp
     */
-    function totalClaimableAssetsAtTime(uint256 timestamp) external view returns (uint256 claimableAssets) {
-        claimableAssets = totalWithdrawingAssets;
+    function totalClaimableAssetsAtTime(uint256 timestamp) external view returns (uint256 _amount) {
+        _amount = totalWithdrawingAssets;
         for (uint256 i = latestRequestId; i > 0; i--) {
             WithdrawalRequest storage req = withdrawalRequests[i];
             if (req.claimed) continue;
             if (timestamp < req.timestamp + redemptionPeriod) {
-                claimableAssets -= req.assets;
+                _amount -= req.assets;
             }
         }
     }
