@@ -41,6 +41,7 @@ contract CustomVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Acce
     uint256 public exchangeRateExpireInterval;
     uint256 public latestRequestId;
     uint256 public totalAssetsCap;
+    uint256 public minDepositAmount;
 
     uint256 public totalWithdrawingAssets;
     uint256 public totalWithdrawingShares;
@@ -74,6 +75,8 @@ contract CustomVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Acce
     event WithdrawalRequested(uint256 indexed id, address indexed owner, address receiver, uint256 shares, uint256 assets);
     event WithdrawalClaimed(uint256 indexed id, address indexed owner, address receiver, uint256 assets);
 
+    event AssetWithdrawnByProtocol(address indexed addr, address token, uint256 amount);
+    event MinDepositAmountChanged(uint256 oldMin, uint256 newMin);
     event RedemptionPeriodUpdated(uint256 oldPeriod, uint256 newPeriod);
     event ExchangeRateExpireIntervalUpdated(uint256 oldInterval, uint256 newInterval);
     event ExchangeRateUpdated(uint256 oldRate, uint256 newRate, uint256 timestamp);
@@ -101,7 +104,7 @@ contract CustomVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Acce
             hasRole(BACKEND_ROLE, _msgSender()) ||
             hasRole(PROTOCOL_ADMIN_ROLE, _msgSender()) ||
             hasRole(DEFAULT_ADMIN_ROLE, _msgSender()),
-            "Not Authorized Updater or Admin"
+            "Not Authorized Admin"
         );
         _;
     }
@@ -149,6 +152,7 @@ contract CustomVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Acce
         exchangeRateExpireInterval = 5 days;
         exchangeRateUpdateTime = block.timestamp;
         totalAssetsCap = 1000e6; // 1000 * (10 ** 6) for initial USDC cap for FUJI Testnet 
+        minDepositAmount = 1e5; // 0.01 * (10 ** 6) for Testnet
         totalWithdrawingAssets = 0;
         totalWithdrawingShares = 0;
         redemptionPeriod = 15 minutes;
@@ -181,6 +185,16 @@ contract CustomVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Acce
     function setExchangeRateExpireInterval(uint256 newInterval) external onlyAdmin {
         emit ExchangeRateExpireIntervalUpdated(exchangeRateExpireInterval, newInterval);
         exchangeRateExpireInterval = newInterval;
+    }
+
+    /**
+    * @notice Sets minDepositAmount
+    * @param newMin New minimum deposit amount  
+    * @dev Only callable by admin
+    */
+    function setMinDepositAmount(uint256 newMin) external onlyAdmin {
+        emit MinDepositAmountChanged(minDepositAmount, newMin);
+        minDepositAmount = newMin;
     }
 
     /**
@@ -253,6 +267,17 @@ contract CustomVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Acce
         address destination
     ) external onlyWhitelisted(destination) onlyBackendAndAdmin nonReentrant {
         IERC20(_asset).safeTransfer(destination, amount);
+        emit AssetWithdrawnByProtocol(destination, _asset, amount);
+    }
+
+    // --- Disable Native Token Transfers ---
+
+    receive() external payable {
+        revert("Native token transfers are not allowed");
+    }
+
+    fallback() external payable {
+        revert("Native token transfers are not allowed");
     }
 
     // --- Overwritten Conversion Logic ---
@@ -274,10 +299,13 @@ contract CustomVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Acce
     // --- Override deposit and mint functions to add whenUpToDate ---
 
     function mint(uint256 shares, address receiver) public override whenUpToDate whenUnderCap(previewMint(shares)) returns (uint256) {
+        uint256 depositAmount = _convertToAssets(shares, Math.Rounding.Ceil);
+        require(depositAmount >= minDepositAmount, "Amount is below minimum deposit");
         return super.mint(shares, receiver);
     }
 
     function deposit(uint256 assets, address receiver) public override whenUpToDate whenUnderCap(assets) returns (uint256) {
+        require(assets >= minDepositAmount, "Amount is below minimum deposit");
         return super.deposit(assets, receiver);
     }
 
@@ -288,7 +316,7 @@ contract CustomVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Acce
         address receiver,
         address owner
     ) public override returns (uint256) {
-        revert("Withdrawals must go through requestWithdraw()");
+        revert("Withdrawals must go through requestWithdrawal()");
     }
 
     function redeem(
@@ -296,7 +324,7 @@ contract CustomVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Acce
         address receiver,
         address owner
     ) public override returns (uint256) {
-        revert("Withdrawals must go through requestWithdraw()");
+        revert("Withdrawals must go through requestWithdrawal()");
     }
 
     function _withdraw(
@@ -306,7 +334,7 @@ contract CustomVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Acce
         uint256 assets,
         uint256 shares
     ) internal override virtual {
-        revert("Withdrawals must go through requestWithdraw()");
+        revert("Withdrawals must go through requestWithdrawal()");
     }
 
     // --- Withdrawal Request & Redemption Flow ---
