@@ -472,7 +472,7 @@ contract CustomVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Acce
             if (ownerFilter != address(0) && req.owner != ownerFilter) continue;
             if (receiverFilter != address(0) && req.receiver != receiverFilter) continue;
             if (onlyUnclaimed && req.claimed) continue;
-            if (onlyClaimable && block.timestamp < req.timestamp + redemptionPeriod) continue;
+            if (onlyClaimable && req.claimed && block.timestamp < req.timestamp + redemptionPeriod) continue;
             temp[found++] = WithdrawalRequestView({
                 requestId: i+1,
                 assets: req.assets,
