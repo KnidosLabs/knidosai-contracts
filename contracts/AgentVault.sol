@@ -440,7 +440,7 @@ contract CustomVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Acce
     */
     function timeUntilClaimable(uint256 requestId) external view returns (uint256) {
         WithdrawalRequest storage req = withdrawalRequests[requestId];
-        if (block.timestamp >= req.timestamp + redemptionPeriod) {
+        if (req.claimed || block.timestamp >= req.timestamp + redemptionPeriod) {
             return 0;
         }
         return (req.timestamp + redemptionPeriod) - block.timestamp;
