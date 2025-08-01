@@ -229,6 +229,7 @@ contract CustomVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Acce
             req.allowTransfer = allowTransfer;
         }
 
+        require(req.target == target && req.allowTransfer == allowTransfer, "Can't approve a request with incorrect parameters");
         req.approvals[_msgSender()] = true;
         req.approvalCount++;
 
