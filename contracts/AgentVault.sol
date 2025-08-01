@@ -348,6 +348,7 @@ contract CustomVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Acce
     */
     function requestWithdrawal(uint256 shares, address receiver) external whenUpToDate returns (uint256 requestId) {
         require(shares > 0, "Zero Shares");
+        require(receiver != address(0), "Receiver is Zero Address");
         address owner = _msgSender(); // only token owner can withdraw
         uint256 maxShares = maxRedeem(owner);
         if (shares > maxShares) {
