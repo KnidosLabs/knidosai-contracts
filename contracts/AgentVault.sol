@@ -314,6 +314,18 @@ contract CustomVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Acce
         return super.deposit(assets, receiver);
     }
 
+    // --- Override maxDeposit and maxMint functions for compliance ---
+
+    function maxMint(address) public view override virtual returns (uint256) {
+        if (totalAssets() >= totalAssetsCap) return 0;
+        return previewDeposit(totalAssetsCap - totalAssets());
+    }
+
+    function maxDeposit(address) public view override virtual returns (uint256) {
+        if (totalAssets() >= totalAssetsCap) return 0;
+        return totalAssetsCap - totalAssets();
+    }
+
     // --- Override default withdraw/redeem flow of ERC4626 ---
 
     function withdraw(
