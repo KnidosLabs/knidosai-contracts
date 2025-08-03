@@ -158,6 +158,10 @@ contract CustomVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Acce
         redemptionPeriod = 15 minutes;
         requiredApprovals = _multisigSigners.length;
         for (uint i = 0; i < _multisigSigners.length; i++) {
+            require(_multisigSigners[i] != address(0), "Multisig Signer cannot be Zero Address");
+            for (uint j = 0; j < i; j++) {
+                require(_multisigSigners[i] != _multisigSigners[j], "Multisig Signer cannot be duplicated");
+            }
             multisigSigners.push(_multisigSigners[i]);
         }
     }
