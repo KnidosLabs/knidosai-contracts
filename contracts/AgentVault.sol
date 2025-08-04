@@ -147,11 +147,11 @@ contract CustomVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Acce
         _grantRole(BACKEND_ROLE, admin);
 
         require(_multisigSigners.length > 0, "No admins");
-        MIN_EXCHANGE_RATE = 5e17; // 0.5 test param
-        exchangeRate = 1e18; // 1 share = 1 asset initially
+        MIN_EXCHANGE_RATE = 5 * (10 ** 17); // 1 share = 0.5 asset
+        exchangeRate = 1 * (10 ** 18); // 1 share = 1 asset 
         exchangeRateExpireInterval = 15 minutes;
         exchangeRateUpdateTime = block.timestamp;
-        totalAssetsCap = 1000e6; // 1000 * (10 ** 6) for initial USDC cap for FUJI Testnet 
+        totalAssetsCap = 1_000_000 * (10 ** 6); // 1,000,000 USDC 
         minDepositAmount = 10 * (10 ** 6); // 10 USDC
         totalWithdrawingAssets = 0;
         totalWithdrawingShares = 0;
