@@ -152,7 +152,7 @@ contract CustomVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Acce
         exchangeRateExpireInterval = 5 days;
         exchangeRateUpdateTime = block.timestamp;
         totalAssetsCap = 1000e6; // 1000 * (10 ** 6) for initial USDC cap for FUJI Testnet 
-        minDepositAmount = 1e5; // 0.01 * (10 ** 6) for Testnet
+        minDepositAmount = 10 * (10 ** 6); // 10 USDC
         totalWithdrawingAssets = 0;
         totalWithdrawingShares = 0;
         redemptionPeriod = 15 minutes;
