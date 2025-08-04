@@ -149,13 +149,13 @@ contract CustomVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Acce
         require(_multisigSigners.length > 0, "No admins");
         MIN_EXCHANGE_RATE = 5e17; // 0.5 test param
         exchangeRate = 1e18; // 1 share = 1 asset initially
-        exchangeRateExpireInterval = 5 days;
+        exchangeRateExpireInterval = 15 minutes;
         exchangeRateUpdateTime = block.timestamp;
         totalAssetsCap = 1000e6; // 1000 * (10 ** 6) for initial USDC cap for FUJI Testnet 
         minDepositAmount = 10 * (10 ** 6); // 10 USDC
         totalWithdrawingAssets = 0;
         totalWithdrawingShares = 0;
-        redemptionPeriod = 15 minutes;
+        redemptionPeriod = 7 days;
         requiredApprovals = _multisigSigners.length;
         for (uint i = 0; i < _multisigSigners.length; i++) {
             require(_multisigSigners[i] != address(0), "Multisig Signer cannot be Zero Address");
