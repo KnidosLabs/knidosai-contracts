@@ -287,18 +287,26 @@ contract CustomVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Acce
 
     // --- Overwritten Conversion Logic ---
 
-    function _convertToAssets(uint256 shares, Math.Rounding rounding) internal view override virtual returns (uint256) {
-        return shares.mulDiv(exchangeRate, 10 ** (18 + _decimalsOffset()), rounding);
+    /** @dev Override decimals() to prevent ERC4626 initialization decimal matching. */
+    function decimals() public override view virtual returns (uint8) {
+        return 18;
     }
 
+    /** @dev Assumes underlying asset has 6 decimals and shares are 18 decimals. */
+    function _convertToAssets(uint256 shares, Math.Rounding rounding) internal view override virtual returns (uint256) {
+        return shares.mulDiv(exchangeRate, 10 ** (18 + 12), rounding);
+    }
+
+    /** @dev Assumes underlying asset has 6 decimals and shares are 18 decimals. */
     function _convertToShares(uint256 assets, Math.Rounding rounding) internal view override virtual returns (uint256) {
-        return assets.mulDiv(10 ** (18 + _decimalsOffset()), exchangeRate, rounding);
+        return assets.mulDiv(10 ** (18 + 12), exchangeRate, rounding);
     }
 
     // --- totalAssets Based on Exchange Rate ---
 
+    /** @dev Assumes underlying asset has 6 decimals and shares are 18 decimals. */
     function totalAssets() public view override returns (uint256) {
-        return ((totalSupply() * exchangeRate) / 1e18) / (10 ** _decimalsOffset());
+        return ((totalSupply() * exchangeRate) / 1e18) / (10 ** 12);
     }
 
     // --- Override deposit and mint functions to add whenUpToDate ---
