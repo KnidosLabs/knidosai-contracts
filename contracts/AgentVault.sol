@@ -245,14 +245,11 @@ contract CustomVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Acce
     }
 
     function assetsCapChange(uint256 newTarget) external onlyMultisigSigners {
-        if (capChangeRequest.target != newTarget) {
+        if (capChangeRequest.approvalCount == 0) {
             capChangeRequest.target = newTarget;
-            capChangeRequest.approvalCount = 0;
-            for (uint256 i = 0; i < multisigSigners.length; i++) {
-                capChangeRequest.approvals[multisigSigners[i]] = false;
-            }
         }
 
+        require(capChangeRequest.target == newTarget, "Cannot approve a request with different targets");
         require(!capChangeRequest.approvals[_msgSender()], "Already approved");
         capChangeRequest.approvals[_msgSender()] = true;
         capChangeRequest.approvalCount += 1;
