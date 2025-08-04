@@ -70,6 +70,18 @@ contract CustomVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Acce
     }
     AssetsCapChangeRequest public capChangeRequest;
 
+    enum ActionType { Add, Remove }
+    uint256 public constant MIN_SIGNERS = 2;
+
+    struct SignerChangeRequest {
+        ActionType action;
+        address target;
+        uint256 approvalCount;
+        mapping(address => bool) approvals;
+    }
+
+    SignerChangeRequest public signerChangeRequest;
+
     // --- Events ---
 
     event WithdrawalRequested(uint256 indexed id, address indexed owner, address receiver, uint256 shares, uint256 assets);
@@ -221,6 +233,51 @@ contract CustomVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Acce
             if (multisigSigners[i] == addr) return true;
         }
         return false;
+    }
+
+    function signerChange(ActionType action, address target) external onlyMultisigSigners {
+        require(target != address(0), "Target is Zero Address");
+        require(
+            (action == ActionType.Add && !isMultisigSigner(target)) ||
+            (action == ActionType.Remove && isMultisigSigner(target) && multisigSigners.length > MIN_SIGNERS),
+            "Invalid signer change request"
+        );
+
+        if (signerChangeRequest.approvalCount == 0) {
+            signerChangeRequest.action = action;
+            signerChangeRequest.target = target;
+        }
+
+        require(signerChangeRequest.action == action && signerChangeRequest.target == target, "Conflicting Request parameters");
+        require(!signerChangeRequest.approvals[_msgSender()], "Already approved");
+
+        signerChangeRequest.approvals[_msgSender()] = true;
+        signerChangeRequest.approvalCount += 1;
+
+        if (signerChangeRequest.approvalCount >= requiredApprovals) {
+            if (action == ActionType.Add) {
+                multisigSigners.push(target);
+            } else if (action == ActionType.Remove) {
+                for (uint256 i = 0; i < multisigSigners.length; i++) {
+                    if (multisigSigners[i] == target) {
+                        multisigSigners[i] = multisigSigners[multisigSigners.length - 1];
+                        multisigSigners.pop();
+                        break;
+                    }
+                }
+            }
+
+            if (multisigSigners.length <= 2) {
+                requiredApprovals = 2;
+            } else {
+                requiredApprovals = (multisigSigners.length + 1) / 2;
+            }
+
+            signerChangeRequest.approvalCount = 0;
+            for (uint256 i = 0; i < multisigSigners.length; i++) {
+                signerChangeRequest.approvals[multisigSigners[i]] = false;
+            }
+        }
     }
 
     function whitelistChange(address target, bool allowTransfer, uint256 reqId) external onlyMultisigSigners {
