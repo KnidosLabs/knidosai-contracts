@@ -325,6 +325,7 @@ contract CustomVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Acce
         uint256 amount,
         address destination
     ) external onlyWhitelisted(destination) onlyBackendAndAdmin nonReentrant {
+        require(amount <= (IERC20(_asset).balanceOf(address(this)) - totalWithdrawingAssets), "Insufficient available balance to protocol withdraw.");
         IERC20(_asset).safeTransfer(destination, amount);
         emit AssetWithdrawnByProtocol(destination, _asset, amount);
     }
