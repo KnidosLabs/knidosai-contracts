@@ -145,6 +145,7 @@ contract CustomVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Acce
         string memory _name,
         string memory _symbol,
         address admin,
+        address backend,
         address[] memory _multisigSigners
     ) public initializer {
         __ERC4626_init(IERC20Metadata(_asset));
@@ -153,10 +154,9 @@ contract CustomVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Acce
         __ReentrancyGuard_init();
         __UUPSUpgradeable_init();
 
-        // TEST PARAMETERS
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
         _grantRole(PROTOCOL_ADMIN_ROLE, admin);
-        _grantRole(BACKEND_ROLE, admin);
+        _grantRole(BACKEND_ROLE, backend);
 
         require(_multisigSigners.length > 0, "No admins");
         MIN_EXCHANGE_RATE = 5 * (10 ** 17); // 1 share = 0.5 asset
@@ -490,10 +490,10 @@ contract CustomVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Acce
         require(block.timestamp >= request.timestamp + redemptionPeriod, "Redemption period not over!");
 
         request.claimed = true;
-        IERC20(asset()).safeTransfer(request.receiver, request.assets);
-
         totalWithdrawingAssets -= request.assets;
         totalWithdrawingShares -= request.shares;
+
+        IERC20(asset()).safeTransfer(request.receiver, request.assets);
         emit WithdrawalClaimed(requestId, request.owner, request.receiver, request.assets);
     }
 
