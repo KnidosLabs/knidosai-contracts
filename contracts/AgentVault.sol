@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.28;
+pragma solidity ^0.8.24;
 
 import "@openzeppelin/contracts-upgradeable/token/ERC20/extensions/ERC4626Upgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
@@ -14,11 +14,10 @@ contract CustomVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Acce
     bytes32 public constant BACKEND_ROLE = keccak256("BACKEND_ROLE");
     bytes32 public constant PROTOCOL_ADMIN_ROLE = keccak256("PROTOCOL_ADMIN_ROLE");
 
-    uint256 public MIN_EXCHANGE_RATE;
-
     struct WithdrawalRequest {
         uint256 assets;
         uint256 shares;
+        uint256 fee;
         address owner;
         address receiver;
         uint256 timestamp;
@@ -29,12 +28,14 @@ contract CustomVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Acce
         uint256 requestId;
         uint256 assets;
         uint256 shares;
+        uint256 fee;
         address owner;
         address receiver;
         uint256 timestamp;
         bool claimed;
     }
 
+    uint256 public MIN_EXCHANGE_RATE;
     uint256 public redemptionPeriod;
     uint256 public exchangeRate; // scaled by 1e18
     uint256 public exchangeRateUpdateTime;
@@ -42,11 +43,18 @@ contract CustomVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Acce
     uint256 public latestRequestId;
     uint256 public totalAssetsCap;
     uint256 public minDepositAmount;
+    uint256 public minWithdrawalAmount;
 
     uint256 public totalWithdrawingAssets;
     uint256 public totalWithdrawingShares;
 
     mapping(uint256 => WithdrawalRequest) public withdrawalRequests;
+
+    // --- Fee Related Configs ---
+    mapping(address => uint256) public principal;  // Total user principal in asset terms
+    mapping(address => uint256) public avgCost;    // Weighted average exchangeRate for user
+    uint256 public PERFORMANCE_FEE_BPS; // 20% = 2000 bps
+    address public treasury;
 
     // --- Multisig Whitelisting related constants ---
 
@@ -84,16 +92,19 @@ contract CustomVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Acce
 
     // --- Events ---
 
-    event WithdrawalRequested(uint256 indexed id, address indexed owner, address receiver, uint256 shares, uint256 assets);
-    event WithdrawalClaimed(uint256 indexed id, address indexed owner, address receiver, uint256 assets);
+    event WithdrawalRequested(uint256 indexed id, address indexed owner, address receiver, uint256 shares, uint256 assets, uint256 fee, uint256 feeRatio);
+    event WithdrawalClaimed(uint256 indexed id, address indexed owner, address receiver, uint256 assets, uint256 fee, address feeReceiver);
 
     event AssetWithdrawnByProtocol(address indexed addr, address token, uint256 amount);
     event MinDepositAmountChanged(uint256 oldMin, uint256 newMin);
+    event MinWithdrawalAmountChanged(uint256 oldMin, uint256 newMin);
     event RedemptionPeriodUpdated(uint256 oldPeriod, uint256 newPeriod);
     event ExchangeRateExpireIntervalUpdated(uint256 oldInterval, uint256 newInterval);
     event ExchangeRateUpdated(uint256 oldRate, uint256 newRate, uint256 timestamp);
     event WhitelistUpdated(address indexed addr, bool status);
     event AssetsCapUpdated(uint256 oldCap, uint256 newCap);
+    event TreasuryUpdated(address oldTreasury, address newTreasury);
+    event PerformanceFeeBPSUpdated(uint256 oldBPS, uint256 newBPS);
 
     // --- Modifiers ---
 
@@ -144,6 +155,7 @@ contract CustomVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Acce
         address _asset,
         string memory _name,
         string memory _symbol,
+        address _treasury,
         address admin,
         address backend,
         address[] memory _multisigSigners
@@ -159,16 +171,19 @@ contract CustomVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Acce
         _grantRole(BACKEND_ROLE, backend);
 
         require(_multisigSigners.length > 0, "No admins");
+        treasury = _treasury;
         MIN_EXCHANGE_RATE = 5 * (10 ** 17); // 1 share = 0.5 asset
         exchangeRate = 1 * (10 ** 18); // 1 share = 1 asset 
         exchangeRateExpireInterval = 15 minutes;
         exchangeRateUpdateTime = block.timestamp;
         totalAssetsCap = 1_000_000 * (10 ** 6); // 1,000,000 USDC 
         minDepositAmount = 10 * (10 ** 6); // 10 USDC
+        minWithdrawalAmount = 1 * (10 ** 16); // 0.01 share
         totalWithdrawingAssets = 0;
         totalWithdrawingShares = 0;
         redemptionPeriod = 7 days;
         requiredApprovals = _multisigSigners.length;
+        PERFORMANCE_FEE_BPS = 2000;
         for (uint i = 0; i < _multisigSigners.length; i++) {
             require(_multisigSigners[i] != address(0), "Multisig Signer cannot be Zero Address");
             for (uint j = 0; j < i; j++) {
@@ -176,11 +191,32 @@ contract CustomVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Acce
             }
             multisigSigners.push(_multisigSigners[i]);
         }
+        isWhitelisted[backend] = true;
     }
 
     function _authorizeUpgrade(address newImplementation) internal override onlyAdmin {}
 
     // --- Backend Setter Functions / Vault Exchange Rate Management ---
+
+    /**
+    * @notice Sets performance fee treasury
+    * @param _treasury New performance fee treasury address  
+    * @dev Only callable by admin
+    */
+    function setTreasury(address _treasury) external onlyAdmin {
+        emit TreasuryUpdated(treasury, _treasury);
+        treasury = _treasury;
+    }
+
+    /**
+    * @notice Sets performance fee bps
+    * @param newBPS New performance fee ratio  
+    * @dev Only callable by admin
+    */
+    function setPerformanceFeeBPS(uint256 newBPS) external onlyAdmin {
+        emit PerformanceFeeBPSUpdated(PERFORMANCE_FEE_BPS, newBPS);
+        PERFORMANCE_FEE_BPS = newBPS;
+    }
 
     /**
     * @notice Sets Redemption Period
@@ -214,13 +250,23 @@ contract CustomVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Acce
     }
 
     /**
+    * @notice Sets minWithdrawalAmount
+    * @param newMin New minimum withdrawal amount  
+    * @dev Only callable by admin
+    */
+    function setMinWithdrawalAmount(uint256 newMin) external onlyAdmin {
+        emit MinWithdrawalAmountChanged(minWithdrawalAmount, newMin);
+        minWithdrawalAmount = newMin;
+    }
+
+    /**
     * @notice Sets exchangeRate and exchangeRateUpdateTime
     * @param newRate New Interval  
     * @dev New rate can't go below 1 which is the initial value,
     *      Callable by updater or admin
     */
     function setExchangeRate(uint256 newRate) external onlyBackendAndAdmin {
-        require(newRate >= MIN_EXCHANGE_RATE, "exchangeRate can not be below initial value of 1e18");
+        require(newRate >= MIN_EXCHANGE_RATE, "exchangeRate can not be below minimum value!");
         exchangeRateUpdateTime = block.timestamp;
         emit ExchangeRateUpdated(exchangeRate, newRate, exchangeRateUpdateTime);
         exchangeRate = newRate;
@@ -343,6 +389,67 @@ contract CustomVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Acce
         revert("Native token transfers are not allowed");
     }
 
+    // --- Principal/Cost Average Tracking Internal Helper ---
+
+    function _updateCostOnDeposit(address user, uint256 depositedAssets) internal {
+        uint256 oldPrincipal = principal[user];
+        uint256 oldAvgCost = avgCost[user];
+
+        uint256 newPrincipal = oldPrincipal + depositedAssets;
+
+        if (oldPrincipal == 0) {
+            avgCost[user] = exchangeRate;
+        } else {
+            avgCost[user] = ((oldPrincipal * oldAvgCost) + (depositedAssets * exchangeRate)) / newPrincipal; // Weighted average
+        }
+        principal[user] = newPrincipal;
+    }
+
+    function _updateCostOnWithdraw(address user, uint256 shares) internal {
+        uint256 userSharesBefore = balanceOf(user) + shares; // shares before burning
+        uint256 principalToRemove = (principal[user] * shares) / userSharesBefore;
+
+        principal[user] -= principalToRemove;
+
+        if (balanceOf(user) == 0) {
+            avgCost[user] = 0; // reset if no shares left
+        }
+    }
+
+    function _handleCostBasisTransfer(address from, address to, uint256 shares) internal {
+        if (from == to || shares == 0) return;
+        uint256 senderSharesBefore = balanceOf(from);
+        require(senderSharesBefore >= shares, "Insufficient shares");
+        uint256 principalTransfer = ((shares * avgCost[from]) / 1e18) / 1e12;
+
+        // Update sender
+        uint256 senderAverageCostBefore = avgCost[from];
+        principal[from] -= principalTransfer;
+        if (senderSharesBefore == shares) {
+            avgCost[from] = 0; // sender moved all shares
+        }
+        // Update receiver
+        if (principal[to] == 0) {
+            avgCost[to] = senderAverageCostBefore;
+        } else {
+            avgCost[to] = ((principal[to] * avgCost[to]) + (principalTransfer * senderAverageCostBefore)) / (principal[to] + principalTransfer);
+        }
+        principal[to] += principalTransfer;
+    }
+
+    // --- Override transfer functions to update cost basis ---
+    function transfer(address to, uint256 amount) public override(ERC20Upgradeable, IERC20) returns (bool) {
+        address from = _msgSender();
+        _handleCostBasisTransfer(from, to, amount);
+        return super.transfer(to, amount);
+    }
+
+    function transferFrom(address from, address to, uint256 amount) public override(ERC20Upgradeable, IERC20) returns (bool) {
+        _handleCostBasisTransfer(from, to, amount);
+        return super.transferFrom(from, to, amount);
+    }
+
+
     // --- Overwritten Conversion Logic ---
 
     /** @dev Override decimals() to prevent ERC4626 initialization decimal matching. */
@@ -372,11 +479,13 @@ contract CustomVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Acce
     function mint(uint256 shares, address receiver) public override whenUpToDate whenUnderCap(previewMint(shares)) returns (uint256) {
         uint256 depositAmount = _convertToAssets(shares, Math.Rounding.Ceil);
         require(depositAmount >= minDepositAmount, "Amount is below minimum deposit");
+        _updateCostOnDeposit(receiver, depositAmount);
         return super.mint(shares, receiver);
     }
 
     function deposit(uint256 assets, address receiver) public override whenUpToDate whenUnderCap(assets) returns (uint256) {
         require(assets >= minDepositAmount, "Amount is below minimum deposit");
+        _updateCostOnDeposit(receiver, assets);
         return super.deposit(assets, receiver);
     }
 
@@ -431,6 +540,7 @@ contract CustomVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Acce
     */
     function requestWithdrawal(uint256 shares, address receiver) external whenUpToDate returns (uint256 requestId) {
         require(shares > 0, "Zero Shares");
+        require(shares >= minWithdrawalAmount, "Amount is below minimum withdrawal");
         require(receiver != address(0), "Receiver is Zero Address");
         address owner = _msgSender(); // only token owner can withdraw
         uint256 maxShares = maxRedeem(owner);
@@ -440,12 +550,24 @@ contract CustomVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Acce
 
         uint256 assets = previewRedeem(shares);
 
+        uint256 costForSharesInAssets = ((shares * avgCost[owner]) / 1e18) / 1e12;
+        require(costForSharesInAssets <= assets, "Cost > assets");
+
+        uint256 performanceFee = 0;
+        if (assets > costForSharesInAssets) {
+            uint256 profit = assets - costForSharesInAssets;
+            performanceFee = (profit * PERFORMANCE_FEE_BPS) / 10000;
+            assets -= performanceFee;
+        }
+
         _burn(owner, shares);
+        _updateCostOnWithdraw(owner, shares);
 
         requestId = latestRequestId + 1;
         withdrawalRequests[requestId] = WithdrawalRequest({
             assets: assets,
             shares: shares,
+            fee: performanceFee,
             owner: owner,
             receiver: receiver,
             timestamp: block.timestamp,
@@ -456,7 +578,7 @@ contract CustomVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Acce
         totalWithdrawingAssets += assets;
         totalWithdrawingShares += shares;
 
-        emit WithdrawalRequested(requestId, owner, receiver, shares, assets);
+        emit WithdrawalRequested(requestId, owner, receiver, shares, assets, performanceFee, PERFORMANCE_FEE_BPS);
     }
 
     /**
@@ -494,7 +616,10 @@ contract CustomVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Acce
         totalWithdrawingShares -= request.shares;
 
         IERC20(asset()).safeTransfer(request.receiver, request.assets);
-        emit WithdrawalClaimed(requestId, request.owner, request.receiver, request.assets);
+        if (request.fee > 0) {
+            IERC20(asset()).safeTransfer(treasury, request.fee);
+        }
+        emit WithdrawalClaimed(requestId, request.owner, request.receiver, request.assets, request.fee, treasury);
     }
 
     // --- Views ---
@@ -560,6 +685,7 @@ contract CustomVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Acce
                 requestId: i+1,
                 assets: req.assets,
                 shares: req.shares,
+                fee: req.fee,
                 owner: req.owner,
                 receiver: req.receiver,
                 timestamp: req.timestamp,
