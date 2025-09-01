@@ -52,7 +52,6 @@ contract CustomVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Acce
 
     // --- Fee Related Configs ---
     mapping(address => uint256) public principal;  // Total user principal in asset terms
-    mapping(address => uint256) public avgCost;    // Weighted average exchangeRate for user
     uint256 public PERFORMANCE_FEE_BPS; // 20% = 2000 bps
     address public treasury;
 
@@ -392,48 +391,21 @@ contract CustomVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Acce
     // --- Principal/Cost Average Tracking Internal Helper ---
 
     function _updateCostOnDeposit(address user, uint256 depositedAssets) internal {
-        uint256 oldPrincipal = principal[user];
-        uint256 oldAvgCost = avgCost[user];
-
-        uint256 newPrincipal = oldPrincipal + depositedAssets;
-
-        if (oldPrincipal == 0) {
-            avgCost[user] = exchangeRate;
-        } else {
-            avgCost[user] = ((oldPrincipal * oldAvgCost) + (depositedAssets * exchangeRate)) / newPrincipal; // Weighted average
-        }
-        principal[user] = newPrincipal;
+        principal[user] += depositedAssets;
     }
 
     function _updateCostOnWithdraw(address user, uint256 shares) internal {
         uint256 userSharesBefore = balanceOf(user) + shares; // shares before burning
         uint256 principalToRemove = (principal[user] * shares) / userSharesBefore;
-
         principal[user] -= principalToRemove;
-
-        if (balanceOf(user) == 0) {
-            avgCost[user] = 0; // reset if no shares left
-        }
     }
 
     function _handleCostBasisTransfer(address from, address to, uint256 shares) internal {
         if (from == to || shares == 0) return;
         uint256 senderSharesBefore = balanceOf(from);
         require(senderSharesBefore >= shares, "Insufficient shares");
-        uint256 principalTransfer = ((shares * avgCost[from]) / 1e18) / 1e12;
-
-        // Update sender
-        uint256 senderAverageCostBefore = avgCost[from];
+        uint256 principalTransfer = (principal[from] * shares) / senderSharesBefore;
         principal[from] -= principalTransfer;
-        if (senderSharesBefore == shares) {
-            avgCost[from] = 0; // sender moved all shares
-        }
-        // Update receiver
-        if (principal[to] == 0) {
-            avgCost[to] = senderAverageCostBefore;
-        } else {
-            avgCost[to] = ((principal[to] * avgCost[to]) + (principalTransfer * senderAverageCostBefore)) / (principal[to] + principalTransfer);
-        }
         principal[to] += principalTransfer;
     }
 
@@ -448,7 +420,6 @@ contract CustomVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Acce
         _handleCostBasisTransfer(from, to, amount);
         return super.transferFrom(from, to, amount);
     }
-
 
     // --- Overwritten Conversion Logic ---
 
@@ -550,7 +521,7 @@ contract CustomVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Acce
 
         uint256 assets = previewRedeem(shares);
 
-        uint256 costForSharesInAssets = ((shares * avgCost[owner]) / 1e18) / 1e12;
+        uint256 costForSharesInAssets = (principal[owner] * shares) / balanceOf(owner);
         require(costForSharesInAssets <= assets, "Cost > assets");
 
         uint256 performanceFee = 0;
