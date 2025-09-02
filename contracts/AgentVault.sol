@@ -522,8 +522,6 @@ contract CustomVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Acce
         uint256 assets = previewRedeem(shares);
 
         uint256 costForSharesInAssets = (principal[owner] * shares) / balanceOf(owner);
-        require(costForSharesInAssets <= assets, "Cost > assets");
-
         uint256 performanceFee = 0;
         if (assets > costForSharesInAssets) {
             uint256 profit = assets - costForSharesInAssets;
