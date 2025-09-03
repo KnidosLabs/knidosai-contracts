@@ -203,6 +203,7 @@ contract CustomVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Acce
     * @dev Only callable by admin
     */
     function setTreasury(address _treasury) external onlyAdmin {
+        // TODO: add zero address check for treasury
         emit TreasuryUpdated(treasury, _treasury);
         treasury = _treasury;
     }
